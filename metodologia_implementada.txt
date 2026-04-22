@@ -1,0 +1,147 @@
+# Metodologia Detalhada do Código (models.ipynb)
+
+Este documento descreve linha por linha e célula por célula as etapas implementadas no notebook `models.ipynb` para a predição da temperatura do ar em Belém, utilizando fusão de dados (Satélite + INMET) e modelos de aprendizado de máquina.
+
+---
+
+## Célula 1: Configuração Inicial e Importação de Bibliotecas
+**Objetivo:** Configurar o ambiente de execução, importar bibliotecas essenciais para manipulação de dados, modelagem e visualização, e garantir a reprodutibilidade dos experimentos.
+
+*   **Imports:**
+    *   `numpy` (np), `pandas` (pd): Manipulação de arrays e DataFrames.
+    *   `tensorflow` (tf): Construção e treinamento de redes neurais (LSTM).
+    *   `matplotlib.pyplot`, `seaborn`: Criação de gráficos para análise exploratória e resultados.
+    *   `sklearn`: Ferramentas de Machine Learning (métricas, modelos lineares, Random Forest, pré-processamento, validação cruzada).
+    *   `statsmodels`: Modelagem de séries temporais (SARIMAX).
+*   **Reprodutibilidade:**
+    *   `SEED = 42`: Define uma semente global.
+    *   `set_seeds(seed)`: Função que fixa a semente aleatória para `numpy`, `tensorflow` e `random`, garantindo que os resultados sejam idênticos em todas as execuções.
+
+---
+
+## Célula 2: Leitura e Pré-processamento dos Dados (Data Wrangling)
+**Objetivo:** Carregar os dados brutos, limpar inconsistências e fundir as bases de dados de satélite e estação meteorológica (INMET).
+
+1.  **Dados de Satélite:**
+    *   Leitura do CSV: `BELEM_temperature_2m_1994-2024 (3).csv`.
+    *   Conversão de Data: Coluna `date` convertida para formato `datetime`.
+    *   Conversão de Unidade: Temperatura convertida de Kelvin para Celsius (`- 273.15`).
+    *   Renomeação: Variável alvo renomeada para `sat_temp`.
+
+2.  **Dados do INMET (Alvo):**
+    *   Leitura do CSV: Tenta ler `inmet_clean.csv`. Se falhar, lê o bruto `dados_82191_D...csv`.
+    *   Tratamento de Nulos: Valores como 'null', 'nan' são tratados.
+    *   Agregação Diária: Se houver para dados horários duplicados, agrupa pela média diária (`groupby('date').mean()`).
+
+3.  **Fusão (Merge):**
+    *   `pd.merge(..., how='inner')`: Interseção das datas comuns entre Satélite e INMET.
+    *   `set_index('date')`: A data se torna o índice da série temporal.
+
+4.  **Regularização Temporal:**
+    *   `reindex(pd.date_range(..., freq='D'))`: Garante que a série tenha uma frequência diária estrita, inserindo "buracos" (NaNs) onde faltam dias.
+    *   **Imputação (Interpolate):**
+        *   `interpolate(method='time')`: Preenche falhas pontuais usando interpolação linear baseada no tempo, assumindo continuidade na temperatura.
+        *   `bfill`/`ffill`: Preenchimento residual nas bordas da série.
+
+---
+
+## Célula 3: Engenharia de Atributos (Refined V3)
+**Objetivo:** Criar variáveis preditoras (features) que capturem padrões temporais, tendências e interações físicas para alimentar os modelos supervisionados (Random Forest e Stacking).
+
+1.  **Memória Térmica (Rolling Windows) - Satélite:**
+    *   `sat_roll_7`, `sat_roll_30`: Médias móveis de 7 e 30 dias (deslocadas em 1 dia para evitar vazamento de dados futuros). Capturam o "clima" recente.
+    *   `sat_anom`: Anomalia térmica (temperatura atual - média de 30 dias).
+
+2.  **Tendências (Trends):**
+    *   `trend_7`: Diferença entre a temperatura de ontem e de 7 dias atrás (INMET).
+    *   `sat_trend_7`: O mesmo para o satélite. Indica se está esquentando ou esfriando na semana.
+
+3.  **Diferença de Fusão:**
+    *   `diff_sat_inmet_inst`: Diferença instantânea (Erro do satélite no dia).
+
+4.  **Sazonalidade Cíclica:**
+    *   `sin_day`, `cos_day`: Transformação do dia do ano (1-365) em coordenadas de círculo trigonométrico. Permite ao modelo entender que dia 365 (Dez) é próximo do dia 1 (Jan).
+
+5.  **Lags (Autocorrelação):**
+    *   `lag_1` a `lag_30`: Valores passados da temperatura INMET e Satélite. Essencial para modelos de regressão capturarem inércia temporal.
+
+6.  **Variabilidade (Rolling Std):**
+    *   `rolling_std_7`, `14`, `30`: Desvio padrão móvel. Captura instabilidade climática recente.
+
+*   `dropna()`: Remove as primeiras 30 linhas que ficaram vazias devido à criação de lags e janelas.
+
+---
+
+## Célula 4: Divisão dos Dados (Split Temporal)
+**Objetivo:** Separar os dados respeitando a ordem cronológica para evitar vazamento temporal (data leakage).
+
+*   **Treino (Train):** Dados até 2016. Usado para ajustar pesos dos modelos.
+*   **Validação (Val):** 2017 a 2020. Usado para tunagem de hiperparâmetros e Early Stopping.
+*   **Teste (Test):** 2021 em diante. Dados inéditos para avaliação final.
+*   **Feature Sets:** Definição de listas de colunas para diferentes cenários (`cols_sat_only`, `cols_fusion_feat`, etc.).
+
+---
+
+## Célula 5: Otimização Random Forest
+**Objetivo:** Encontrar os melhores hiperparâmetros para o modelo Random Forest e treinar os cenários base.
+
+1.  **Grid de Parâmetros:**
+    *   `n_estimators`: Número de árvores (300, 500).
+    *   `max_depth`: Profundidade máxima das árvores (controla overfitting).
+    *   `min_samples_leaf`: Mínimo de amostras para folha.
+2.  **RandomizedSearchCV:**
+    *   Busca aleatória combinada com `TimeSeriesSplit` (validação cruzada temporal) para selecionar a melhor configuração sem violar a ordem temporal.
+3.  **Treinamento dos Cenários:**
+    *   `RF_SatOnly`: Usa apenas dados de satélite.
+    *   `RF_Fusion`: Usa Satélite + Lags básicos.
+    *   `RF_Fusion_Features`: Usa todas as features avançadas (Trends, Rolling Std).
+
+---
+
+## Célula 6 (Legado): SARIMAX (Pipeline Antigo)
+*Nota: Esta célula foi mantida para histórico, mas o modelo SARIMAX oficial para comparação foi reimplementado no Pipeline Paralelo (Final).*
+
+---
+
+## Célula 8: Stacking Ensemble (Refinado)
+**Objetivo:** Combinar as predições dos modelos base para criar um preditor mais robusto.
+
+1.  **Modelos Base:** `RF_Fusion_Features`, `RF_Fusion`, `SARIMAX`. (LSTM foi removido desta etapa por decisão técnica).
+2.  **Meta-Modelo (RidgeCV):**
+    *   Regressão Ridge com validação cruzada interna para escolher o parâmetro de regularização (`alpha`).
+    *   Aprende pesos ótimos para cada modelo base, penalizando modelos correlacionados ou ruidosos.
+3.  **Predição:** Gera a coluna `Stacking_Final`.
+
+---
+
+## Célula 9 (Nova): Pipeline Paralelo (Metodologia Corrigida V2)
+**Objetivo:** Implementar versões de SARIMAX e LSTM cientificamente rigorosas, isoladas do pipeline anterior para garantir integridade e evitar vazamento de dados.
+
+### 1. Recarregamento Limpo dos Dados (`df_seq`)
+*   **Independência:** Os dados brutos são recarregados para criar um dataset dedicado (`df_seq`). Isso garante que operações de imputação anteriores não afetem a sensibilidade do SARIMAX.
+*   **Frequência:** Aplicação estrita de `asfreq('D')` com imputação subsequente (`interpolate`) para garantir que não haja "buracos" temporais invisíveis que prejudicam modelos de série temporal.
+*   **Lags para LSTM:** Criação de colunas `inmet_lag_1` a `inmet_lag_30` *antes* do split, garantindo que o modelo LSTM use apenas o passado conhecido e nunca o alvo futuro (evitando data leakage).
+
+### 2. SARIMAX V2 (Sazonalidade Robusta)
+*   **Janela de Treino:** Aumentada para 5 anos (1825 dias) para capturar múltiplos ciclos de El Niño/La Niña e variabilidade interanual.
+*   **Exógenas:** Inclui `sat_temp` (satélite), `sat_roll` (memória), e componentes harmônicos (`sin_day`, `cos_day`) para modelar a sazonalidade anual de forma eficiente.
+*   **Parâmetros de Ajuste:** Configurado para tolerar a não-estacionariedade estrita (`enforce_stationarity=False`) em prol de um ajuste mais estável em janelas longas.
+
+### 3. LSTM V2 (Deep Learning Otimizado)
+*   **Input Features:** Usa exclusivamente Lags do INMET, dados de Satélite e Sazonalidade. O alvo (`inmet_temp` no tempo `t`) não entra como feature.
+*   **Normalização:**
+    *   `StandardScaler` para as entradas (X): Lida melhor com outliers climáticos.
+    *   `MinMaxScaler` para a saída (y): Otimizado para funções de ativação.
+*   **Arquitetura Profunda:**
+    *   **LSTM 1:** 128 neurônios, retornando sequências. Captura padrões complexos de longo prazo.
+    *   **Dropout:** 0.3 para prevenção agressiva de overfitting.
+    *   **LSTM 2:** 64 neurônios. Condensa a representação temporal.
+    *   **Dense:** Camada de 32 neurônios (ReLU) antes da regressão final.
+*   **Treinamento:** Sequências longas de 60 dias (`TIMESTEPS=60`) para memória sazonal curta.
+
+### 4. Avaliação Unificada
+*   As predições do novo Pipeline Paralelo (`SARIMAX_V2`, `LSTM_V2`) são unificadas com os melhores resultados do Pipeline Random Forest (`RF_Best`, `Stacking`).
+*   Métricas calculadas: RMSE, MAE, R², Viés e NSE. As comparações são feitas no mesmo conjunto de teste (2021-2024).
+
+---
+*Este documento reflete a metodologia final, corrigida para garantir rigor científico, ausência de vazamento de dados e tratamento adequado da sazonalidade climática.*
